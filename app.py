@@ -3,13 +3,20 @@ from __future__ import annotations
 import hashlib
 import os
 import time
+import random
+import secrets
+import string
 from datetime import date
 
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from adaptive import difficulty_for_topic, next_best_action
 from agent_system import AgentContext, Orchestrator
-from config import DEFAULT_GROQ_MODEL, GROQ_MODELS, UI_COLORS, get_student_id
+from config import (
+    DEFAULT_GROQ_MODEL, GROQ_MODELS, UI_COLORS, UI_THEMES, FONT_SIZES,
+    DEFAULT_THEME, DEFAULT_FONT_SIZE, get_student_id, get_secret,
+)
 from db import (
     add_achievement,
     achievements,
@@ -31,6 +38,15 @@ from db import (
     update_preferences,
     update_student,
     weak_topics,
+    progress_history,
+    topic_progress,
+    reset_student_learning_data,
+    create_published_quiz,
+    get_published_quiz,
+    published_quizzes_for_creator,
+    save_published_quiz_result,
+    published_quiz_results,
+    published_quiz_completion,
 )
 from documents import chunk_pages, download_drive, extract_document
 from groq_service import grounded_answer
@@ -73,6 +89,18 @@ if "last_quiz_result" not in st.session_state:
     st.session_state.last_quiz_result = None
 if "tutor_messages" not in st.session_state:
     st.session_state.tutor_messages = []
+if "quiz_started_at" not in st.session_state:
+    st.session_state.quiz_started_at = None
+if "quiz_duration_minutes" not in st.session_state:
+    st.session_state.quiz_duration_minutes = 30
+if "published_quiz" not in st.session_state:
+    st.session_state.published_quiz = None
+if "published_answers" not in st.session_state:
+    st.session_state.published_answers = {}
+if "published_started_at" not in st.session_state:
+    st.session_state.published_started_at = None
+if "published_duration_minutes" not in st.session_state:
+    st.session_state.published_duration_minutes = 30
 
 
 # -----------------------------------------------------------------------------
@@ -125,6 +153,9 @@ def render_profile_setup() -> None:
         st.session_state.personal_index = None
         st.session_state.personal_info = []
         st.session_state.tutor_messages = []
+        st.session_state.quiz_started_at = None
+        st.session_state.published_quiz = None
+        st.session_state.published_answers = {}
         ensure_student(sid, name)
         update_student(sid, name=name, level=level)
         prefs = get_preferences(sid)
@@ -157,8 +188,20 @@ if "ui_color" not in st.session_state:
     st.session_state.ui_color = preferences.get("ui_color") or "Blue"
 if st.session_state.ui_color not in UI_COLORS:
     st.session_state.ui_color = "Blue"
+if "theme" not in st.session_state:
+    st.session_state.theme = preferences.get("theme") or DEFAULT_THEME
+if st.session_state.theme not in UI_THEMES:
+    st.session_state.theme = DEFAULT_THEME
+if "font_size" not in st.session_state:
+    st.session_state.font_size = preferences.get("font_size") or DEFAULT_FONT_SIZE
+if st.session_state.font_size not in FONT_SIZES:
+    st.session_state.font_size = DEFAULT_FONT_SIZE
 
-apply_theme(UI_COLORS[st.session_state.ui_color])
+apply_theme(
+    UI_COLORS[st.session_state.ui_color],
+    st.session_state.theme,
+    FONT_SIZES[st.session_state.font_size],
+)
 
 
 # -----------------------------------------------------------------------------
@@ -183,10 +226,18 @@ with st.sidebar:
             "Study Plan",
             "Memory",
             "History",
+            "Published Quizzes",
             "Settings",
         ],
         label_visibility="collapsed",
     )
+
+    mem_stats = LongTermMemory(student_id).stats()
+    memory_cap = 10 * 1024 * 1024
+    memory_ratio = min(mem_stats["vector_bytes"] / memory_cap, 1.0)
+    st.caption(f"🧠 Long-term memory: {mem_stats['count']} memories · {mem_stats['vector_bytes']/1024:.1f} KB")
+    st.progress(memory_ratio, text=f"Memory used: {memory_ratio*100:.1f}% of 10 MB")
+    st.divider()
 
     if st.button("Change Student Profile"):
         st.session_state.profile_complete = False
@@ -288,11 +339,32 @@ def render_dashboard() -> None:
         "Your adaptive learning dashboard is personalized to this Student ID.",
     )
     stats = dashboard_stats(student_id)
-    cols = st.columns(4)
-    cols[0].metric("Overall Mastery", f"{stats['overall']}%", help="Average mastery across your topics. See 'How is mastery calculated?' below.")
-    cols[1].metric("Questions Answered", stats["attempted"], help=f"{stats['skipped']} skipped question(s) are not counted here." if stats["skipped"] else None)
-    cols[2].metric("Accuracy", f"{stats['accuracy']}%")
-    cols[3].metric("Revision Due", stats["revision_due"])
+    cols = st.columns(3)
+    cols[0].metric("Questions Answered", stats["attempted"], help=f"{stats['skipped']} skipped question(s) are not counted here." if stats["skipped"] else None)
+    cols[1].metric("Revision Due", stats["revision_due"])
+    cols[2].metric("Topics Tracked", stats["topics_tracked"])
+
+    st.markdown("### 📊 Learning Progress")
+    topic_rows = topic_progress(student_id, 12)
+    history_rows = progress_history(student_id, 20)
+    chart_col1, chart_col2 = st.columns(2)
+    with chart_col1:
+        st.caption("Topic mastery")
+        if topic_rows:
+            topic_chart = {
+                f"{r['subject']} → {r['topic']}": float(r['mastery_score'])
+                for r in reversed(topic_rows)
+            }
+            st.bar_chart(topic_chart, y_label="Mastery", x_label="Topic")
+        else:
+            st.info("Complete a quiz to build the mastery graph.")
+    with chart_col2:
+        st.caption("Quiz score trend")
+        if history_rows:
+            scores = [float(r["score"]) for r in history_rows]
+            st.line_chart({"Quiz score": scores}, y_label="Score", x_label="Quiz attempt")
+        else:
+            st.info("Your quiz score trend will appear here.")
 
     action = next_best_action(student_id)
     st.markdown("### 🎯 Next Best Action")
@@ -424,6 +496,7 @@ def render_personalized_controls() -> None:
     mode_name = st.selectbox("Mode", ["MCQs", "Answer explanation", "Quiz"], key="personal_mode")
     difficulty = st.selectbox("Difficulty", ["Adaptive", "Easy", "Medium", "Hard"], key="personal_difficulty")
     count = st.slider("Number of MCQs", 5, 50, 20, key="personal_count")
+    duration_minutes = st.number_input("Quiz time limit (minutes)", 1, 180, 30, key="personal_duration")
     instructions = st.text_area("Optional instructions", key="personal_instructions")
 
     if st.button("Start Personalized Learning", type="primary"):
@@ -501,12 +574,31 @@ def render_learn() -> None:
             st.divider()
             render_personalized_controls()
 
+    if not st.session_state.get("quiz") and st.session_state.get("last_quiz_result"):
+        result = st.session_state["last_quiz_result"]
+        st.markdown("## Latest Quiz Result")
+        st.write(f"**Score:** {result['correct']}/{len(result['questions'])} correct")
+        with st.expander("Review answers"):
+            for i, q in enumerate(result["questions"]):
+                selected = result["answers"].get(i, "Skipped")
+                correct_answer = str(q.get("answer", "")).strip()
+                mark = "✅ Correct" if selected == correct_answer else "❌ Incorrect"
+                st.markdown(f"**Q{i + 1}.** {mark} · Your answer: {selected} · Correct: {correct_answer}")
+        st.download_button(
+            "Download Latest Quiz PDF",
+            questions_to_pdf("Prep AI Quiz", result["questions"]),
+            "prep_ai_quiz.pdf",
+            "application/pdf",
+            key="download_latest_quiz_pdf",
+        )
+
     with tabs[1]:
         subject = st.selectbox("Subject", ["Biology", "Chemistry", "Physics", "English"], key="db_subject")
         topic = st.text_input("Chapter / Topic", key="db_topic")
         mode_name = st.selectbox("Mode", ["MCQs", "Answer explanation", "Quiz"], key="db_mode")
         difficulty = st.selectbox("Difficulty", ["Adaptive", "Easy", "Medium", "Hard"], key="db_difficulty")
         count = st.slider("Number of MCQs", 5, 50, 20, key="db_count")
+        duration_minutes = st.number_input("Quiz time limit (minutes)", 1, 180, 30, key="db_duration")
         instructions = st.text_area("Optional instructions", key="db_instructions")
 
         if st.button("Start Database Learning", type="primary"):
@@ -561,8 +653,11 @@ def render_learn() -> None:
                             "topic": topic,
                             "difficulty": actual,
                             "sources": results,
+                            "duration_minutes": int(duration_minutes),
                         }
                         st.session_state.quiz_answers = {}
+                        st.session_state.quiz_started_at = time.time()
+                        st.session_state.quiz_duration_minutes = int(duration_minutes)
                         st.session_state.last_quiz_result = None
                         st.success("Quiz created. Open Practice → Current Quiz to take it.")
                         source_cards(results)
@@ -588,7 +683,22 @@ def render_practice() -> None:
             st.info("No active quiz. Start one from Learn or Practice My Weak Topics.")
         else:
             questions = quiz["questions"]
-            st.write(f"**{quiz['subject']} → {quiz['topic']}** · {quiz['difficulty']} · {len(questions)} questions")
+            duration = int(quiz.get("duration_minutes", st.session_state.get("quiz_duration_minutes", 30)))
+            started = st.session_state.get("quiz_started_at") or time.time()
+            st.session_state.quiz_started_at = started
+            remaining = max(0, duration * 60 - int(time.time() - started))
+
+            # Refresh once per second so the countdown is visible without manual clicks.
+            if remaining > 0:
+                st_autorefresh(interval=1000, key="active_quiz_timer")
+
+            mins, secs = divmod(remaining, 60)
+            st.progress(remaining / max(1, duration * 60), text=f"⏳ Time remaining: {mins:02d}:{secs:02d}")
+            st.write(
+                f"**{quiz['subject']} → {quiz['topic']}** · {quiz['difficulty']} · "
+                f"{len(questions)} questions · {duration} minutes"
+            )
+
             for i, q in enumerate(questions):
                 st.markdown(f"### Q{i + 1}. {q.get('question', '')}")
                 options = q.get("options") or {}
@@ -602,7 +712,11 @@ def render_practice() -> None:
                 if choice:
                     st.session_state.quiz_answers[i] = choice
 
-            if st.button("Submit Quiz", type="primary"):
+            should_submit = remaining <= 0
+            if st.button("Submit Quiz", type="primary", disabled=should_submit is False and remaining <= 0):
+                should_submit = True
+
+            if should_submit:
                 try:
                     answers = dict(st.session_state.quiz_answers)
                     quiz_id = record_quiz(
@@ -625,7 +739,14 @@ def render_practice() -> None:
                     }
                     if correct == len(questions):
                         add_achievement(student_id, "perfect_quiz", "Perfect Quiz")
-                    st.success(f"Quiz submitted: {correct}/{len(questions)} correct.")
+                    st.session_state.quiz = None
+                    st.session_state.quiz_started_at = None
+                    st.session_state.quiz_answers = {}
+                    if remaining <= 0:
+                        st.warning(f"⏰ Time is up. Your quiz was submitted automatically: {correct}/{len(questions)} correct.")
+                    else:
+                        st.success(f"Quiz submitted: {correct}/{len(questions)} correct.")
+                    st.rerun()
                 except Exception as exc:
                     st.error("Prep AI could not save this quiz result. Please try again.")
                     if st.session_state.get("debug_mode"):
@@ -646,7 +767,7 @@ def render_practice() -> None:
 
                 st.download_button(
                     "Download Quiz PDF",
-                    questions_to_pdf("Prep AI Quiz", questions),
+                    questions_to_pdf("Prep AI Quiz", result["questions"]),
                     "prep_ai_quiz.pdf",
                     "application/pdf",
                 )
@@ -694,8 +815,11 @@ def render_practice() -> None:
                             "topic": x["topic"],
                             "difficulty": difficulty,
                             "sources": sources,
+                            "duration_minutes": 30,
                         }
                         st.session_state.quiz_answers = {}
+                        st.session_state.quiz_started_at = time.time()
+                        st.session_state.quiz_duration_minutes = 30
                         st.session_state.last_quiz_result = None
                         st.success("Targeted quiz created. The page will open Current Quiz now.")
                         st.rerun()
@@ -845,8 +969,11 @@ def render_practice() -> None:
                             "difficulty": revision_difficulty,
                             "sources": sources,
                             "revision": True,
+                            "duration_minutes": 30,
                         }
                         st.session_state.quiz_answers = {}
+                        st.session_state.quiz_started_at = time.time()
+                        st.session_state.quiz_duration_minutes = 30
                         st.session_state.last_quiz_result = None
                         st.session_state.revision_quiz_created = True
                         st.success(
@@ -1276,11 +1403,205 @@ def render_memory() -> None:
         else:
             st.dataframe(sessions, use_container_width=True, hide_index=True)
 
-    if st.button("Clear My Long-Term Memory"):
-        memory.clear()
-        st.session_state.tutor_messages = []
-        st.success("Long-term semantic memory cleared. Agent session history is retained separately for audit/history.")
-        st.rerun()
+    stats = memory.stats()
+    st.caption(
+        f"Stored semantic memories: **{stats['count']}** · "
+        f"Vector storage: **{stats['vector_bytes'] / 1024:.1f} KB**"
+    )
+    st.progress(
+        min(stats["vector_bytes"] / (10 * 1024 * 1024), 1.0),
+        text="Approximate semantic-memory storage usage (10 MB display scale)",
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🧹 Clear Semantic Memory", type="secondary"):
+            memory.clear()
+            st.session_state.tutor_messages = []
+            st.success("Semantic long-term memory cleared. Quiz/history records were kept.")
+            st.rerun()
+    with c2:
+        if st.button("⚠️ Reset All My Learning Data", type="secondary"):
+            reset_student_learning_data(student_id)
+            memory.clear()
+            st.session_state.tutor_messages = []
+            st.session_state.quiz = None
+            st.session_state.quiz_answers = {}
+            st.session_state.last_quiz_result = None
+            st.success("Your learning history, memories, mistakes, mastery and agent sessions were reset. Your profile remains.")
+            st.rerun()
+
+
+
+def _new_quiz_code() -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(8))
+
+
+def _student_quiz_order(questions: list[dict], code: str, student_id_value: str) -> list[dict]:
+    """Give each student a deterministic-but-different question order."""
+    ordered = [dict(q) for q in questions]
+    random.Random(f"{code}:{student_id_value}").shuffle(ordered)
+    return ordered
+
+
+def render_published_quizzes() -> None:
+    hero(
+        "🌐 Published Quizzes",
+        "Publish one quiz for multiple students, give each student a randomized sequence, and keep results visible only to the tutor.",
+    )
+    tabs = st.tabs(["Publish", "Join Quiz", "My Published Quizzes", "Tutor Results"])
+
+    with tabs[0]:
+        st.subheader("Publish the current quiz")
+        quiz = st.session_state.get("quiz")
+        if not quiz:
+            st.info("Create a quiz from Learn first, then return here to publish it.")
+        else:
+            title = st.text_input(
+                "Quiz title",
+                value=f"{quiz.get('subject', 'Quiz')} — {quiz.get('topic', 'Practice')}",
+                key="publish_title",
+            )
+            expected = st.number_input(
+                "Expected number of students",
+                min_value=1, max_value=1000, value=10, step=1,
+                key="publish_expected",
+            )
+            duration = st.number_input(
+                "Time limit (minutes)",
+                min_value=1, max_value=180,
+                value=int(quiz.get("duration_minutes", 30)), step=1,
+                key="publish_duration",
+            )
+            st.caption(f"{len(quiz['questions'])} questions · {quiz.get('difficulty', 'Medium')} difficulty")
+            if st.button("🚀 Publish Quiz", type="primary"):
+                code = _new_quiz_code()
+                create_published_quiz(
+                    code, title, student_id, quiz.get("subject", ""),
+                    quiz.get("topic", ""), quiz.get("difficulty", "Medium"),
+                    int(duration), int(expected), quiz["questions"],
+                )
+                st.success("Quiz published successfully.")
+                st.code(code, language="text")
+                st.info("Share this quiz code with your students. Their question sequence will be different.")
+
+    with tabs[1]:
+        st.subheader("Join a Published Quiz")
+        code = st.text_input("Enter quiz code", max_chars=20, key="join_quiz_code").strip().upper()
+        if st.button("Load Published Quiz", type="primary"):
+            published = get_published_quiz(code)
+            if not published:
+                st.error("Quiz code not found or the quiz is no longer active.")
+            else:
+                existing = published_quiz_results(int(published["id"]))
+                if any(r["student_id"] == student_id for r in existing):
+                    st.warning("You have already submitted this published quiz.")
+                else:
+                    ordered = _student_quiz_order(published["questions"], code, student_id)
+                    st.session_state.published_quiz = published | {"questions": ordered}
+                    st.session_state.published_answers = {}
+                    st.session_state.published_started_at = time.time()
+                    st.session_state.published_duration_minutes = int(published["duration_minutes"])
+                    st.rerun()
+
+        published = st.session_state.get("published_quiz")
+        if published:
+            duration = int(published["duration_minutes"])
+            started = st.session_state.get("published_started_at") or time.time()
+            remaining = max(0, duration * 60 - int(time.time() - started))
+            if remaining > 0:
+                st_autorefresh(interval=1000, key="published_quiz_timer")
+            mins, secs = divmod(remaining, 60)
+            st.progress(
+                remaining / max(1, duration * 60),
+                text=f"⏳ Time remaining: {mins:02d}:{secs:02d}",
+            )
+            st.write(
+                f"**{published['title']}** · {published['subject']} → {published['topic']} · "
+                f"{len(published['questions'])} questions"
+            )
+            for i, q in enumerate(published["questions"]):
+                options = q.get("options") or {}
+                choice = st.radio(
+                    f"Q{i + 1}. {q.get('question', '')}",
+                    list(options.keys()),
+                    format_func=lambda k, q=q: f"{k}. {q['options'][k]}",
+                    key=f"published_{published['code']}_{i}",
+                    index=None,
+                )
+                if choice:
+                    st.session_state.published_answers[i] = choice
+
+            submit = remaining <= 0 or st.button("Submit Published Quiz", type="primary")
+            if submit:
+                answers = dict(st.session_state.published_answers)
+                result = save_published_quiz_result(
+                    int(published["id"]), student_id,
+                    st.session_state.student_name, published["questions"], answers,
+                )
+                # Also add the result to the student's normal adaptive history.
+                record_quiz(
+                    student_id, published["subject"], published["topic"],
+                    published["questions"], answers, published["difficulty"],
+                )
+                st.session_state.published_quiz = None
+                st.session_state.published_answers = {}
+                st.session_state.published_started_at = None
+                if remaining <= 0:
+                    st.warning(f"⏰ Time is up. Your published quiz was submitted automatically. Score: {result['score']:.1f}%")
+                else:
+                    st.success(f"Published quiz submitted. Score: {result['score']:.1f}%")
+                st.rerun()
+
+    with tabs[2]:
+        rows = published_quizzes_for_creator(student_id, 30)
+        if not rows:
+            st.info("You have not published any quizzes yet.")
+        else:
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+            for row in rows[:10]:
+                completion = published_quiz_completion(int(row["id"]))
+                st.write(
+                    f"**{row['title']}** · Code `{row['code']}` · "
+                    f"Completed: {completion['completed']}/{completion['expected'] or 'open'}"
+                )
+
+    with tabs[3]:
+        tutor_code = st.text_input("Tutor access code", type="password", key="tutor_access_code")
+        configured_code = get_secret("TUTOR_ACCESS_CODE", "") or ""
+        if not configured_code:
+            st.warning("Tutor results are disabled until TUTOR_ACCESS_CODE is added to Streamlit Secrets.")
+        elif st.button("Open Tutor Results", type="primary"):
+            if not secrets.compare_digest(tutor_code, configured_code):
+                st.error("Invalid tutor access code.")
+            else:
+                st.session_state.tutor_authenticated = True
+
+        if st.session_state.get("tutor_authenticated"):
+            rows = []
+            # Only published quizzes that exist in the database are shown here.
+            with_quizzes = published_quizzes_for_creator(student_id, 100)
+            # The tutor can enter any quiz code, including quizzes created by another student.
+            code = st.text_input("Published quiz code to review", key="tutor_quiz_code").strip().upper()
+            if code:
+                published = get_published_quiz(code)
+                if not published:
+                    st.error("Published quiz not found.")
+                else:
+                    results = published_quiz_results(int(published["id"]))
+                    completion = published_quiz_completion(int(published["id"]))
+                    st.subheader(published["title"])
+                    st.caption(
+                        f"Completion: {completion['completed']}/{completion['expected'] or 'open'} · "
+                        f"{published['subject']} → {published['topic']}"
+                    )
+                    if results:
+                        st.dataframe(results, use_container_width=True, hide_index=True)
+                        scores = [float(r["score"]) for r in results]
+                        st.bar_chart({"Student score": scores}, y_label="Score", x_label="Completed student")
+                    else:
+                        st.info("No student has submitted this quiz yet.")
 
 
 def render_history() -> None:
@@ -1304,10 +1625,16 @@ def render_settings() -> None:
     prefs = get_preferences(student_id)
     saved_model = prefs.get("llm_model") or st.session_state.get("llm_model", DEFAULT_GROQ_MODEL)
     saved_color = prefs.get("ui_color") or st.session_state.get("ui_color", "Blue")
+    saved_theme = prefs.get("theme") or st.session_state.get("theme", DEFAULT_THEME)
+    saved_font = prefs.get("font_size") or st.session_state.get("font_size", DEFAULT_FONT_SIZE)
     if saved_model not in GROQ_MODELS:
         saved_model = DEFAULT_GROQ_MODEL
     if saved_color not in UI_COLORS:
         saved_color = "Blue"
+    if saved_theme not in UI_THEMES:
+        saved_theme = DEFAULT_THEME
+    if saved_font not in FONT_SIZES:
+        saved_font = DEFAULT_FONT_SIZE
 
     with st.form("settings_form"):
         model = st.selectbox(
@@ -1319,7 +1646,9 @@ def render_settings() -> None:
                 "openai/gpt-oss-20b": "GPT-OSS 20B — Faster / lower cost",
             }.get(value, value),
         )
-        color = st.selectbox("UI Color", list(UI_COLORS), index=list(UI_COLORS).index(saved_color))
+        color = st.selectbox("Accent Color", list(UI_COLORS), index=list(UI_COLORS).index(saved_color))
+        theme = st.selectbox("Application Theme", UI_THEMES, index=UI_THEMES.index(saved_theme))
+        font_size = st.selectbox("Font Size", list(FONT_SIZES), index=list(FONT_SIZES).index(saved_font))
         difficulty = st.selectbox(
             "Preferred difficulty",
             ["Easy", "Medium", "Hard", "Adaptive"],
@@ -1358,6 +1687,8 @@ def render_settings() -> None:
             student_id,
             llm_model=model,
             ui_color=color,
+            theme=theme,
+            font_size=font_size,
             preferred_difficulty=difficulty,
             preferred_language=language,
             explanation_style=explanation,
@@ -1365,6 +1696,8 @@ def render_settings() -> None:
         )
         st.session_state.llm_model = model
         st.session_state.ui_color = color
+        st.session_state.theme = theme
+        st.session_state.font_size = font_size
         st.success("Settings saved for this student.")
         st.rerun()
 
@@ -1392,6 +1725,7 @@ routes = {
     "Study Plan": render_plan,
     "Memory": render_memory,
     "History": render_history,
+    "Published Quizzes": render_published_quizzes,
     "Settings": render_settings,
 }
 
